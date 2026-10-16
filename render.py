@@ -5,7 +5,7 @@ from collections import defaultdict
 
 import discord
 
-from tracker import fmt_age, fmt_price, fmt_r, live_r, r_at, risk
+from tracker import fmt_age, fmt_price, fmt_r, live_r, r_at
 
 GREEN, RED, GREY, BLUE, AMBER = 0x57F287, 0xED4245, 0x99AAB5, 0x5865F2, 0xFEE75C
 
@@ -88,95 +88,23 @@ def trade_embed(t, src_url=None, hub_name="Trade Hub"):
     return e
 
 
-def target_bar(t):
-    """▰ for each target hit, ▱ for each still to go."""
-    hit = sum(1 for tg in t["targets"] if tg["hit"])
-    return "▰" * hit + "▱" * (len(t["targets"]) - hit), hit
-
-
-def stop_distance_r(t):
-    """How far price is from the stop, in R. None if unknown."""
-    if t["status"] != "open" or t.get("last_price") is None:
-        return None
-    return (t["last_price"] - t["stop"]) * (1 if t["direction"] == "long" else -1) / risk(t)
-
-
-def board_row(t, now):
-    link = f"[{t['base']}]({t['_url']})" if t.get("_url") else f"**{t['base']}**"
-    side = "Long" if t["direction"] == "long" else "Short"
-    if t["status"] == "pending":
-        return f"⏳ {link} {side} · limit {fmt_price(t['entry'])} · waiting {fmt_age(now - t['created_at'])}"
-    r = live_r(t)
-    bar, hit = target_bar(t)
-    if t["remaining"] <= 0.01:
-        progress = "all targets"
-    elif t["remaining"] < 99.99:
-        progress = f"{t['remaining']:g}% left"
-    else:
-        progress = f"T{hit}/{len(t['targets'])}" if hit else ""
-    extras = [progress] if progress else []
-    if abs(t["stop"] - t["entry"]) < 1e-12:
-        extras.append("🛡️ BE")
-    extras.append(fmt_age(now - (t["opened_at"] or t["created_at"])))
-    return f"{dot(r)} {link} {side}  `{fmt_r(r)}`  {bar} · " + " · ".join(extras)
-
-
-def board_embed(trades, hub_name="Trade Hub"):
-    now = time.time()
-    live = [t for t in trades if t["status"] in ("open", "pending")]
-    opened = [t for t in live if t["status"] == "open"]
-    pending = len(live) - len(opened)
+def launcher_embed(trades, hub_name="Trade Hub"):
+    """Small card above the 'Open Trade Board' button: just the headline numbers."""
+    opened = [t for t in trades if t["status"] == "open"]
+    pending = sum(1 for t in trades if t["status"] == "pending")
     total = sum(live_r(t) for t in opened)
-
     colour = BLUE if not opened else (GREEN if total > 0.05 else RED if total < -0.05 else GREY)
-    e = discord.Embed(title=f"📊 {hub_name.upper()} — OPEN TRADES", colour=colour)
-    if not live:
-        e.description = "*No open trades right now — new calls appear here automatically.*"
-        e.set_footer(text="Live · updates every minute")
-        e.timestamp = discord.utils.utcnow()
-        return e
-
-    green = sum(1 for t in opened if live_r(t) > 0.05)
-    red = sum(1 for t in opened if live_r(t) < -0.05)
-    summary = [f"**{len(opened)} open** · `{fmt_r(total)}` live · 🟢 {green} / 🔴 {red}"]
-    if pending:
-        summary[0] += f" · ⏳ {pending} pending"
-    highlights = []
+    e = discord.Embed(title=f"📊 {hub_name} trade board", colour=colour)
     if opened:
-        best = max(opened, key=live_r)
-        if live_r(best) > 0.05:
-            highlights.append(f"🏆 Best: {best['analyst']} {best['base']} `{fmt_r(live_r(best))}`")
-        risky = [(stop_distance_r(t), t) for t in opened if stop_distance_r(t) is not None]
-        if risky:
-            dist, t = min(risky, key=lambda x: x[0])
-            if dist < 0.5:
-                highlights.append(f"⚠️ Closest to stop: {t['analyst']} {t['base']} ({dist:.1f}R away)")
-    e.description = "\n".join(summary + ([" · ".join(highlights)] if highlights else []))
-
-    by = defaultdict(list)
-    for t in live:
-        by[t["analyst"]].append(t)
-
-    def analyst_r(name):
-        return sum(live_r(t) for t in by[name] if t["status"] == "open")
-
-    for name in sorted(by, key=lambda n: -analyst_r(n))[:25]:
-        group = sorted(by[name], key=lambda t: (t["status"] != "open", -live_r(t)))
-        n_open = sum(1 for t in group if t["status"] == "open")
-        header = f"{name} · {n_open} open"
-        if n_open:
-            header += f" · {fmt_r(analyst_r(name))}"
-        rows, used = [], 0
-        for i, t in enumerate(group):
-            row = board_row(t, now)
-            if used + len(row) + 1 > 980:  # leave room for "+N more"
-                rows.append(f"*+{len(group) - i} more*")
-                break
-            rows.append(row)
-            used += len(row) + 1
-        e.add_field(name=header, value="\n".join(rows) + "\n\u200b", inline=False)
-
-    e.set_footer(text="Live · updates every minute · tap a coin for the original call")
+        up = sum(1 for t in opened if live_r(t) > 0.05)
+        down = sum(1 for t in opened if live_r(t) < -0.05)
+        line = f"**{len(opened)} open** at **{fmt_r(total)}** · 🟢 {up} / 🔴 {down}"
+        if pending:
+            line += f" · ⏳ {pending} waiting"
+    else:
+        line = f"⏳ {pending} waiting for entry" if pending else "No open trades right now."
+    e.description = line + "\nOpen the board to see every trade, its targets, stop and chart."
+    e.set_footer(text="Live · updates every minute")
     e.timestamp = discord.utils.utcnow()
     return e
 

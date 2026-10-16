@@ -4,7 +4,7 @@ Each analyst posts trades from their own channel. The bot:
 
 - posts a **trade card** (entry, stop, targets, notes, chart) in the analyst's channel
 - mirrors it to a central **hub channel** with a link back to the original
-- keeps one live **📊 Open Trades** board, grouped by analyst, showing live R, % left and days held
+- has a **📊 Trade Board** page that opens inside Discord (a Discord Activity): every open trade with a live price track from stop to final target, plus a detail view with the chart, levels, notes and history
 - watches **live prices** (Binance, falling back to Bybit) and marks targets hit, stops hit and limit fills automatically, using 1-minute candle wicks so nothing is missed between checks
 - pings an **alerts** channel / role for new trades and closes
 - keeps a **leaderboard** of closed trades with `/stats`
@@ -72,17 +72,44 @@ All data lives in `data/` (SQLite database + saved charts) — back that folder 
 
 Tip: set `GUILD_ID` in `.env` to your server ID while testing so slash commands appear instantly (global ones can take up to an hour the first time).
 
+## Trade Board page (Discord Activity)
+
+The board is a web page the bot serves, which Discord opens full-screen inside the app. The `#open-trades` channel gets one small card with an **Open Trade Board** button. Only members of your server can load its trades.
+
+After step 2 you can preview the page with sample data in any browser at `https://trades.yourdomain.com/?demo`.
+
+**1. Point a subdomain at the VPS.** At your DNS provider add an **A record**: `trades` → your VPS's IP.
+
+**2. Put HTTPS in front of the bot with Caddy** (it gets the certificate automatically):
+```bash
+sudo apt install -y caddy
+echo 'trades.yourdomain.com {
+    reverse_proxy 127.0.0.1:8080
+}' | sudo tee /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+Open ports 80 and 443 if you use a firewall (`sudo ufw allow 80,443/tcp`).
+
+**3. Developer Portal** (<https://discord.com/developers/applications> → your app):
+- **OAuth2** → *Reset Secret*, put it in `.env` as `DISCORD_CLIENT_SECRET`. Under *Redirects* add `https://127.0.0.1` (Discord requires one; it isn't used).
+- **Activities → URL Mappings** → *Root Mapping*: `trades.yourdomain.com` (no `https://`).
+- **Activities → Settings** → turn on *Enable Activities* and tick the platforms (desktop, iOS, Android).
+
+**4. Restart the bot** (`sudo systemctl restart tradehub`) and run `/setup channels` if you haven't — the button card appears in your board channel.
+
 ## Files
 | File | Purpose |
 |---|---|
 | `bot.py` | Discord commands, the trade form, price loop, board |
 | `tracker.py` | Trade maths: parsing, R, targets/stops, formatting (no Discord code) |
 | `prices.py` | Binance → Bybit 1-minute candles, no API keys |
-| `render.py` | The embeds: trade card, open-trades board, leaderboard |
+| `render.py` | The embeds: trade card, board button card, leaderboard |
+| `webapp.py` | Web server + API for the Trade Board page (Discord sign-in, members only) |
+| `web/static/` | The Trade Board page itself (HTML/CSS/JS + Discord's Activity SDK, bundled) |
 | `db.py` | SQLite storage |
 | `tests/` | `python -m pytest tests` |
 
 ## Limits worth knowing
 - Crypto only (any pair on Binance spot or Bybit spot/perps). Stocks/forex would need another price source in `prices.py`.
 - If the bot is offline more than ~16 hours, wicks during the gap aren't replayed — check open trades after long downtime.
-- The open-trades board refreshes every 60s; trade cards every 5 min (instantly on any hit).
+- The Trade Board page refreshes every 15s; the button card every 60s; trade cards every 5 min (instantly on any hit).
