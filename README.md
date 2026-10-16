@@ -37,6 +37,8 @@ Analysts can also manage their own trades (trade picker autocompletes):
 
 ## Setup (≈15 minutes)
 
+> **On a VPS?** Follow [DEPLOY.md](DEPLOY.md) — the full server setup (service, HTTPS, Trade Board) step by step.
+
 ### 1. Create the bot
 1. Go to <https://discord.com/developers/applications> → **New Application** → name it.
 2. **Bot** tab → **Reset Token** → copy the token (keep it secret).
