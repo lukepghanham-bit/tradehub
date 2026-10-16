@@ -7,6 +7,7 @@ automatically.
 """
 import asyncio
 import functools
+import hashlib
 import logging
 import os
 import re
@@ -22,15 +23,15 @@ import db
 import prices
 import render
 import tracker
-import webapp
 from tracker import TradeError, fmt_price, fmt_r
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("tradehub")
 
 CHART_DIR = Path(__file__).with_name("data") / "charts"
-PRICE_EVERY = 30           # seconds between price checks
-BOARD_EVERY = 60           # seconds between board edits
+PRICE_EVERY = 5            # seconds between price checks
+BOARD_EVERY = 5            # seconds between board refreshes (only edited when something changed)
+BOARD_HEARTBEAT = 60       # edit at least this often so the 'updated' time stays fresh
 CARD_REFRESH_EVERY = 300   # seconds between "live R" refreshes on trade cards
 MAX_CHART_MB = 10
 
@@ -149,44 +150,50 @@ def is_final(events):
 _board_lock = asyncio.Lock()
 
 
-class LaunchView(discord.ui.View):
-    """The button under the board message that opens the Trade Board Activity."""
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Open Trade Board", emoji="📊", style=discord.ButtonStyle.primary,
-                       custom_id="tradehub:launch")
-    async def launch(self, inter: discord.Interaction, _button):
-        try:
-            await inter.response.launch_activity()
-        except discord.HTTPException as e:
-            log.warning("activity launch failed: %s", e)
-            if not inter.response.is_done():
-                await inter.response.send_message(
-                    "The Trade Board isn't switched on yet — an admin needs to finish the Activity setup "
-                    "(see README → Trade Board).", ephemeral=True)
+_board_last = {}  # guild_id -> (content hash, last edit time)
 
 
 async def update_board(gid, force_new=False):
-    cid = setting(gid, "board_channel")
-    ch = await get_channel(cid)
+    """Keep the single board message in the board channel up to date.
+
+    Called every 5 seconds; only edits the message when the numbers changed
+    (or once a minute), so we stay well inside Discord's rate limits."""
+    ch = await get_channel(setting(gid, "board_channel"))
     if not ch:
         return
-    embed = render.launcher_embed(db.active_trades(gid), hub_name(gid))
+    trades = db.active_trades(gid)
+    for t in trades:
+        t["_url"] = jump(gid, t["channel_id"], t["src_msg_id"])
+    name = hub_name(gid)
+    digest = hashlib.sha1(repr(render.board_content(trades, name)).encode()).hexdigest()
+    last = _board_last.get(gid)
+    if not force_new and last and last[0] == digest and time.time() - last[1] < BOARD_HEARTBEAT:
+        return
+    view = render.board_view(trades, name)
     async with _board_lock:
-        mid = setting(gid, "board_message")
+        mid = setting(gid, "board_message_v2")
         if mid and not force_new:
             try:
-                await ch.get_partial_message(int(mid)).edit(embed=embed, view=LaunchView())
+                await ch.get_partial_message(int(mid)).edit(view=view)
+                _board_last[gid] = (digest, time.time())
                 return
             except discord.NotFound:
                 pass
             except discord.HTTPException as e:
                 log.warning("board edit failed: %s", e)
                 return
-        msg = await ch.send(embed=embed, view=LaunchView())
-        db.set_setting(gid, "board_message", msg.id)
+        # first post (or re-post): remove the previous board message so the channel holds just one
+        for key in ("board_message_v2", "board_message"):
+            old = setting(gid, key)
+            if old:
+                try:
+                    await ch.get_partial_message(int(old)).delete()
+                except discord.HTTPException:
+                    pass
+                db.set_setting(gid, key, None)
+        msg = await ch.send(view=view)
+        db.set_setting(gid, "board_message_v2", msg.id)
+        _board_last[gid] = (digest, time.time())
 
 
 # ====================================================================== price loop
@@ -563,40 +570,18 @@ tree.add_command(analyst_grp)
 
 
 # ====================================================================== startup
-async def sync_commands():
-    """Register slash commands.
-
-    When Activities are enabled, Discord adds a "Launch" entry-point command to the app.
-    discord.py's tree.sync() would try to delete it (and Discord refuses), so for global
-    commands we upload our own list plus the existing entry point ourselves."""
-    gid = os.getenv("GUILD_ID")
-    if gid:  # instant registration while testing in one server
-        g = discord.Object(int(gid))
-        tree.copy_global_to(guild=g)
-        await tree.sync(guild=g)
-        return
-    payload = [cmd.to_dict(tree) for cmd in tree.get_commands()]
-    existing = await client.http.get_global_commands(client.application_id)
-    keep = ("name", "type", "description", "handler", "integration_types", "contexts", "name_localizations",
-            "description_localizations", "default_member_permissions", "nsfw")
-    for cmd in existing:
-        if cmd.get("type") == 4:  # PRIMARY_ENTRY_POINT
-            payload.append({k: cmd[k] for k in keep if cmd.get(k) is not None})
-    await client.http.bulk_upsert_global_commands(client.application_id, payload)
-
-
-_web_runner = None
-
-
 @client.event
 async def on_ready():
-    global http, _web_runner
+    global http
     if http is None:
         http = prices.new_session()
-        client.add_view(LaunchView())
-        await sync_commands()
-    if _web_runner is None and os.getenv("WEB_PORT", "8080") != "0":
-        _web_runner = await webapp.start(client, int(os.getenv("WEB_PORT", "8080")))
+        gid = os.getenv("GUILD_ID")
+        if gid:  # instant command registration while testing in one server
+            g = discord.Object(int(gid))
+            tree.copy_global_to(guild=g)
+            await tree.sync(guild=g)
+        else:
+            await tree.sync()
     if not price_loop.is_running():
         price_loop.start()
     if not board_loop.is_running():

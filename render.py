@@ -88,25 +88,92 @@ def trade_embed(t, src_url=None, hub_name="Trade Hub"):
     return e
 
 
-def launcher_embed(trades, hub_name="Trade Hub"):
-    """Small card above the 'Open Trade Board' button: just the headline numbers."""
-    opened = [t for t in trades if t["status"] == "open"]
-    pending = sum(1 for t in trades if t["status"] == "pending")
+# ---------------------------------------------------------------- the open-trades board
+# Built with Discord's layout components (a container with text blocks and dividers),
+# so the channel reads like a page rather than a chat message.
+
+BOARD_TEXT_LIMIT = 3800  # Discord allows 4000 characters of text across the whole layout
+
+
+def _targets_bar(t):
+    hit = sum(1 for tg in t["targets"] if tg["hit"])
+    return "▰" * hit + "▱" * (len(t["targets"]) - hit), hit
+
+
+def _board_line(t, now):
+    link = f"[{t['base']}]({t['_url']})" if t.get("_url") else f"**{t['base']}**"
+    side = "Long" if t["direction"] == "long" else "Short"
+    if t["status"] == "pending":
+        return f"⏳ {link} {side} · limit {fmt_price(t['entry'])} · now {fmt_price(t.get('last_price'))} · {fmt_age(now - t['created_at'])}"
+    r = live_r(t)
+    bar, hit = _targets_bar(t)
+    bits = [f"T{hit}/{len(t['targets'])}"] if hit else []
+    if t["remaining"] < 99.99:
+        bits.append(f"{t['remaining']:g}% left")
+    if abs(t["stop"] - t["entry"]) < 1e-12:
+        bits.append("🛡️ BE")
+    bits.append(fmt_age(now - (t["opened_at"] or t["created_at"])))
+    return f"{dot(r)} {link} {side} **`{fmt_r(r)}`** {bar} · " + " · ".join(bits)
+
+
+def board_content(trades, hub_name="Trade Hub"):
+    """Returns (blocks, colour). Each block is a markdown string shown as its own
+    section, with dividers between them. Kept separate from Discord objects so it's testable."""
+    now = time.time()
+    live = [t for t in trades if t["status"] in ("open", "pending")]
+    opened = [t for t in live if t["status"] == "open"]
+    pending = [t for t in live if t["status"] == "pending"]
     total = sum(live_r(t) for t in opened)
     colour = BLUE if not opened else (GREEN if total > 0.05 else RED if total < -0.05 else GREY)
-    e = discord.Embed(title=f"📊 {hub_name} trade board", colour=colour)
+
+    head = f"## 📊 {hub_name} — Open Trades ({len(opened)})"
     if opened:
         up = sum(1 for t in opened if live_r(t) > 0.05)
         down = sum(1 for t in opened if live_r(t) < -0.05)
-        line = f"**{len(opened)} open** at **{fmt_r(total)}** · 🟢 {up} / 🔴 {down}"
+        head += f"\n**{fmt_r(total)}** live · 🟢 {up} up · 🔴 {down} down"
         if pending:
-            line += f" · ⏳ {pending} waiting"
+            head += f" · ⏳ {len(pending)} waiting"
+    elif pending:
+        head += f"\n⏳ {len(pending)} waiting for entry"
     else:
-        line = f"⏳ {pending} waiting for entry" if pending else "No open trades right now."
-    e.description = line + "\nOpen the board to see every trade, its targets, stop and chart."
-    e.set_footer(text="Live · updates every minute")
-    e.timestamp = discord.utils.utcnow()
-    return e
+        head += "\nNo open trades right now. New calls show up here automatically."
+    blocks = [head]
+
+    by = defaultdict(list)
+    for t in opened:
+        by[t["analyst"]].append(t)
+    for name in sorted(by, key=lambda n: -sum(live_r(t) for t in by[n])):
+        rows = sorted(by[name], key=live_r, reverse=True)
+        blocks.append(f"### {name} · {fmt_r(sum(live_r(t) for t in rows))}\n" + "\n".join(_board_line(t, now) for t in rows))
+    if pending:
+        blocks.append("### ⏳ Waiting for entry\n" + "\n".join(
+            f"{_board_line(t, now)} · {t['analyst']}" for t in pending))
+
+    # stay inside Discord's text limit: drop whole sections from the bottom, then say so
+    footer_room = 120
+    used, kept = 0, []
+    for b in blocks:
+        # also cap the number of sections: Discord allows 40 layout components per message
+        if used + len(b) > BOARD_TEXT_LIMIT - footer_room or len(kept) >= 16:
+            kept.append(f"*…and {len(blocks) - len(kept)} more sections — use /stats or the trade channels.*")
+            break
+        kept.append(b)
+        used += len(b)
+    return kept, colour
+
+
+def board_view(trades, hub_name="Trade Hub"):
+    blocks, colour = board_content(trades, hub_name)
+    container = discord.ui.Container(accent_colour=colour)
+    for i, block in enumerate(blocks):
+        if i:
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large if i == 1 else discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay(block))
+    container.add_item(discord.ui.Separator(visible=False))
+    container.add_item(discord.ui.TextDisplay(f"-# 🟢 Live · prices refresh every 5s · updated <t:{int(time.time())}:R>"))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
 
 
 def stats_embed(trades, title):
